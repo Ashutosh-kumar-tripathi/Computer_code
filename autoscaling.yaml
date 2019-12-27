@@ -1,0 +1,123 @@
+heat_template_version: 2016-10-14
+description: AutoScaling Wordpress
+parameters:
+  image:
+    type: string
+    description: Image used for servers
+  flavor:
+    type: string
+    description: flavor used by the web servers
+  network:
+    type: string
+    description: Network used by the server
+  subnet_id:
+    type: string
+    description: subnet on which the load balancer will be located
+  external_network_id:
+    type: string
+    description: UUID of a Neutron external network
+resources:
+  asg:
+    type: OS::Heat::AutoScalingGroup
+    properties:
+      min_size: 1
+      max_size: 3
+      resource:
+        type: lb_server.yaml
+        properties:
+          flavor: {get_param: flavor}
+          image: {get_param: image}
+          network: {get_param: network}
+          subnet: {get_param: subnet_id}
+          pool_id: {get_resource: pool}
+          metadata: {"metering.server_group": {get_param: "OS::stack_id"}}
+          user_data_format: RAW
+          user_data: {get_file: ubpw.yaml}
+  web_server_scaleup_policy:
+    type: OS::Heat::ScalingPolicy
+    properties:
+      adjustment_type: change_in_capacity
+      auto_scaling_group_id: {get_resource: asg}
+      cooldown: 60
+      scaling_adjustment: 1
+  cpu_alarm_high:
+    type: OS::Aodh::GnocchiAggregationByResourcesAlarm
+    properties:
+      description: Scale up if CPU > 20%
+      metric: cpu_util
+      aggregation_method: mean
+      granularity: 300
+      evaluation_periods: 1
+      threshold: 20
+      resource_type: instance
+      comparison_operator: gt
+      alarm_actions:
+        - str_replace:
+            template: trust+url
+            params:
+              url: {get_attr: [scaleup_policy, signal_url]}
+      query:
+        str_replace:
+          template: '{"=": {"server_group": "stack_id"}}'
+          params:
+            stack_id: {get_param: "OS::stack_id"}
+  cpu_alarm_high:
+    type: OS::Aodh::Alarm
+    properties:
+      description: Scale up if CPU > 80%
+      meter_name: cpu_util
+      statistic: avg
+      period: 60
+      evaluation_periods: 1
+      threshold: 80
+      comparison_operator: gt
+      alarm_actions:
+        - {get_attr: [web_server_scaleup_policy, alarm_url]}
+      query:
+        list_join:
+          - ''
+          - - {'=': {server_group: {get_param: "OS::stack_id"}}}
+  lb:
+    type: OS::Neutron::LBaaS::LoadBalancer
+    properties:
+      vip_subnet: {get_param: subnet_id}
+  listener:
+    type: OS::Neutron::LBaaS::Listener
+    properties:
+      loadbalancer: {get_resource: lb}
+      protocol: HTTP
+      protocol_port: 80
+  pool:
+    type: OS::Neutron::LBaaS::Pool
+    properties:
+      listener: {get_resource: listener}
+      lb_algorithm: ROUND_ROBIN
+      protocol: HTTP
+      session_persistence:
+        type: SOURCE_IP
+  lb_monitor:
+    type: OS::Neutron::LBaaS::HealthMonitor
+    properties:
+      pool: { get_resource: pool }
+      type: TCP
+      delay: 5
+      max_retries: 5
+      timeout: 5
+  # assign a floating ip address to the load balancer
+  # pool.
+  lb_floating:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: {get_param: external_network_id}
+      port_id: {get_attr: [lb, vip_port_id]}
+
+outputs:
+  scale_up_url:
+    description: >
+      This URL is the webhook to scale up the autoscaling group.  You
+      can invoke the scale-up operation by doing an HTTP POST to this
+      URL; no body nor extra headers are needed.
+    value: {get_attr: [web_server_scaleup_policy, alarm_url]}
+  pool_ip_address:
+    value: {get_attr: [lb, vip_address]}
+    description: The IP address of the load balancing pool
